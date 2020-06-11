@@ -1,8 +1,28 @@
 #!/usr/bin/env python
 import math
 import numpy as np
+import pandas as pd
 import string
 import argparse
+import json
+
+PEPPER_TO_CMU_JOINT_MAPPING = {
+    'HeadYaw': 'Head.Zrotation',
+    'HeadPitch': 'Head.Yrotation',
+    'HipRoll': 'Hips.Xrotation',
+    'HipPitch': 'Hips.Yrotation',
+    'LShoulderPitch': 'LeftShoulder.Yrotation',
+    'LShoulderRoll': 'LeftShoulder.Zrotation',
+    'LElbowYaw': 'LeftArm.Xrotation',
+    'LElbowRoll': 'LeftArm.Zrotation',
+    'LWristYaw': 'LeftForeArm.Xrotation',
+    'RShoulderPitch': 'RightShoulder.Yrotation',
+    'RShoulderRoll': 'RightShoulder.Zrotation',
+    'RElbowYaw': 'RightArm.Xrotation',
+    'RElbowRoll': 'RightArm.Zrotation',
+    'RWristYaw': 'RightForeArm.Xrotation'
+}
+CMU_TO_PEPPER_JOINT_MAPPING = {v:k for k,v in PEPPER_TO_CMU_JOINT_MAPPING.iteritems()}
 
 # map axes strings to/from tuples of inner axis, parity, repetition, frame
 _AXES2TUPLE = {
@@ -72,6 +92,7 @@ def euler_from_matrix(matrix, axes='sxzx'):
     return ax, ay, az
 
 # Node
+import itertools
 class Node:
     def __init__(self, root=False):
         self.name = None
@@ -93,10 +114,20 @@ class Node:
         }
     
     def __repr__(self):
-        return str(self.to_json())
+        return json.dumps(self.to_json(), indent=2)
+
+    def get_node_info_string(self):
+        return '{} [{}]'.format(self.name, ' '.join([channel for channel in self.channels]))
+
+    def get_unique_node_info(self):
+        unique_node_infos = [self.get_node_info_string()]
+        unique_node_infos += itertools.chain.from_iterable([child.get_unique_node_info() for child in self.children])
+        unique_node_infos = list(set(unique_node_infos))
+        unique_node_infos.sort()
+        return unique_node_infos
     
-# BVHReader
-class BVHReader:
+# BVHLoader
+class BVHLoader:
     def __init__(self, filename):
         self.filename = filename # BVH filename
         self.tokenlist = [] # A list of unprocessed tokens (strings)       
@@ -277,11 +308,12 @@ class BVHReader:
             # Handler OnFrame
             self.all_motions.append(list(values))
 
-    # BroadcastRootJoint
-    def broadcastRootJoint(self, root):
+    # extractRootJoint
+    def extractRootJoint(self, root, gesture_dict):
         if root.isEndSite():
-            return
+            return gesture_dict
 
+        # Calculate transformation for mapped joints
         num_channels = len(root.channels)
         flag_trans = 0
         flag_rot = 0
@@ -293,20 +325,10 @@ class BVHReader:
 
         for channel in root.channels:
             keyval = self.this_motion[self.counter]
-            if channel == "Xposition":
-                flag_trans = True
-                x = keyval
-            elif(channel == "Yposition"):
-                flag_trans = True
-                y = keyval
-            elif(channel == "Zposition"):
-                flag_trans = True
-                z = keyval
-            elif(channel == "Xrotation"):
+            if(channel == "Xrotation"):
                 flag_rot = True
                 xrot = keyval
                 theta = math.radians(xrot)
-                rx = theta
                 c = math.cos(theta)
                 s = math.sin(theta)
                 rot_mat_x = np.array([[1.,0.,0.,0.], 
@@ -318,7 +340,6 @@ class BVHReader:
                 flag_rot = True
                 yrot = keyval
                 theta = math.radians(yrot)
-                ry = theta
                 c = math.cos(theta)
                 s = math.sin(theta)
                 rot_mat_y = np.array([[ c,0., s,0.],
@@ -331,7 +352,6 @@ class BVHReader:
                 flaisRootg_rot = True
                 zrot = keyval
                 theta = math.radians(zrot)
-                ry = theta
                 c = math.cos(theta)
                 s = math.sin(theta)
                 rot_mat_z = np.array([[ c,-s,0.,0.],
@@ -339,43 +359,58 @@ class BVHReader:
                                         [0.,0.,1.,0.],
                                         [0.,0.,0.,1.]])
                 rot_mat = np.matmul(rot_mat, rot_mat_z)
-            else:
-                return
-            self.counter += 1
-        
-        if flag_trans:
-            temp_trans = (self.scaling_factor * (x + root.offset[0]), 
-                          self.scaling_factor * (y + root.offset[1]), 
-                          self.scaling_factor * (z + root.offset[2]))
-        else:
-            temp_trans = (self.scaling_factor * (root.offset[0]), 
-                          self.scaling_factor * (root.offset[1]), 
-                          self.scaling_factor * (root.offset[2]))
-
-        print('tx, ty, tz', temp_trans)
-        print('rx, ry, rz', rx, ry, rz)
+            self.counter += 1            
 
         # Transform rotation to Pepper coordinate system
-        rx, ry, rz = euler_from_matrix(rot_mat, axes='sxyz')
+        rx, ry, rz = euler_from_matrix(rot_mat, axes='szyx')
 
-        print('r\'x, r\'y, r\'z', rx, ry, rz)
-        print()
+        cmu_rot_x_name = '{}.Xrotation'.format(root.name)
+        cmu_rot_y_name = '{}.Yrotation'.format(root.name)
+        cmu_rot_z_name = '{}.Zrotation'.format(root.name)
 
-        for each_child in root.children:
-            self.broadcastRootJoint(each_child)
+        if cmu_rot_x_name in CMU_TO_PEPPER_JOINT_MAPPING:
+            pepper_joint_name = CMU_TO_PEPPER_JOINT_MAPPING[cmu_rot_x_name]
+            gesture_dict[pepper_joint_name] = rx
 
-    def broadcast(self, loop=False):
-        for ind in range(self.num_motions):
+        if cmu_rot_y_name in CMU_TO_PEPPER_JOINT_MAPPING:
+            pepper_joint_name = CMU_TO_PEPPER_JOINT_MAPPING[cmu_rot_y_name]
+            gesture_dict[pepper_joint_name] = ry
+
+        if cmu_rot_z_name in CMU_TO_PEPPER_JOINT_MAPPING:
+            pepper_joint_name = CMU_TO_PEPPER_JOINT_MAPPING[cmu_rot_z_name]
+            gesture_dict[pepper_joint_name] = rz
+
+        for child in root.children:
+            gesture_dict = self.extractRootJoint(child, gesture_dict=gesture_dict)
+
+        return gesture_dict
+
+    def toPepperJoint(self, fetch_every=12):
+        gesture_list = []
+        for ind in range(0,self.num_motions,fetch_every):
             self.counter = 0
             self.this_motion = self.all_motions[ind]
-            self.broadcastRootJoint(self.root)
+            gesture_dict = {key: 0.0 for key in PEPPER_TO_CMU_JOINT_MAPPING.keys()}
+            gesture_dict = self.extractRootJoint(self.root, gesture_dict=gesture_dict)
+            gesture_list.append(gesture_dict)
+        return gesture_list
 
 if __name__ == "__main__":
-    bvh_file = '../cmuconvert-mb2/01/01_01.bvh'
-    bvh_test = BVHReader(bvh_file)
-    
+    bvh_file = '../cmuconvert-mb2/113/113_27.bvh'
+    bvh_test = BVHLoader(bvh_file)
+
+    print('== Hierarchy ==')
     print(bvh_test.root)
+    print('== Unique Name & Channels ==')
+    print(bvh_test.root.get_unique_node_info())
+    print('== Motions ==')
     print(len(bvh_test.all_motions))
     
-    bvh_test.broadcast()
-    
+    gesture_list = bvh_test.toPepperJoint()
+    df = pd.DataFrame(gesture_list)
+
+    columns = df.columns.tolist()
+    print(columns)
+    for column in columns:
+        print(column)
+        print(df[column].tolist())
